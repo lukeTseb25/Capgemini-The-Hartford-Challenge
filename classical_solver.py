@@ -1,0 +1,1 @@
+#min(q*sum_i(sum_j(w_iw_j*sigma_i,j))-sum_i(w_i*mu_i)) s.t. sum_i(w_i)=1 and w_i>=0
