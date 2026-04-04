@@ -46,7 +46,7 @@ The final formulation is
 
 <img width="612" height="113" alt="image" src="https://github.com/user-attachments/assets/89dec75a-2aa0-4cb8-820f-4f35d27c94b7" />
 
-Now the formulation is called a quadratic unconstrained binary optimization or QUBO problem. Quadratic because of the term w_i w_j, unconstrained because there are no constraints, and binary because the x_i’s are binary variables. This formulation is a good fit for quantum computers, as it is reminiscent of the Ising model.
+Now the formulation is called a quadratic unconstrained binary optimization or QUBO problem. Quadratic because of the term w_i w_j, unconstrained because there are no constraints, and binary because the w_i’s are binary variables. This formulation is a good fit for quantum computers, as it is reminiscent of the Ising model.
 Techniques such as the Quantum Approximate Optimization Algorithm (QAOA) [1], [2], variational eigen solvers (VQE) [3], [4], or analog approaches [5] may be used to explore large combinatorial landscapes and identify low energy configurations that correspond to promising portfolios.
 
 In this challenge, we encourage you to explore how the structure of the portfolio problem interacts with quantum hardware considerations. Investment portfolios frequently lead to densely connected problem graphs, and you may reflect on how different hardware connectivity models influence the implementation and performance of quantum optimization algorithms.
