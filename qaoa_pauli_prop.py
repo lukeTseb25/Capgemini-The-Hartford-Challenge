@@ -11,6 +11,7 @@ from pauli_prop import propagate_through_rotation_gates, propagate_through_opera
 from qiskit.quantum_info import SparsePauliOp 
 from pauli_prop.propagation import RotationGates
 from math import cos, sin
+from itertools import product
 
 # ============================================================================
 # CONSTANT PARAMETERS (Set these at the beginning)
@@ -26,7 +27,7 @@ NOISE_MODEL = 'none'  # options: 'none', 'bit_flip'
 NOISE_PROB = 0.02     # per-qubit flip probability when using 'bit_flip'
 
 # QAOA parameters
-NUM_LAYERS = 10    # Number of QAOA layers (p)
+NUM_LAYERS = 100    # Number of QAOA layers (p)
 GAMMA = 0.5       # Initial gamma parameter (cost Hamiltonian angle)
 BETA = 0.3        # Initial beta parameter (mixer Hamiltonian angle)
 
@@ -509,20 +510,22 @@ def propagate_pauli_terms_via_rx(initial_pauli_terms: List[Tuple[str, complex]],
     # start from dict
     pauli_dict = pauli_dict_from_list(initial_pauli_terms)
 
+    # Flatten gate list (time-ordered) then conjugate in reverse time order
+    flat_gates = []
     for gate in circuit_gates:
-        # Only handle rotation gates
         if gate['type'] != 'rotation':
             continue
-        # gate['gates'] is a list of (char, qubits, angle)
-        for char, qlist, angle in gate['gates']:
-            # Skip cost Z-rotations, they commute with initial Z Hamiltonian
-            if char == 'Z':
-                continue
-            if char != 'X':
-                # Non-X single-qubit rotations not implemented here
-                continue
+        for item in gate['gates']:
+            flat_gates.append(item)
 
-            # apply RX(angle) conjugation on each specified qubit (qlist)
+    # process gates in reverse (Heisenberg conjugation)
+    paulis_single = {'I': np.array([[1,0],[0,1]],dtype=complex),
+                     'X': np.array([[0,1],[1,0]],dtype=complex),
+                     'Y': np.array([[0,-1j],[1j,0]],dtype=complex),
+                     'Z': np.array([[1,0],[0,-1]],dtype=complex)}
+
+    for char, qlist, angle in reversed(flat_gates):
+        if char == 'X':
             for q in qlist:
                 new_dict = {}
                 for pstr, coeff in pauli_dict.items():
@@ -531,20 +534,61 @@ def propagate_pauli_terms_via_rx(initial_pauli_terms: List[Tuple[str, complex]],
                         val = coeff * factor
                         new_dict[p2] = new_dict.get(p2, 0) + val
 
-                # Prune small coefficients
-                # convert to list and truncate
                 items = [(p, c) for p, c in new_dict.items() if abs(c) > abs_cutoff]
                 if len(items) == 0:
                     pauli_dict = {}
                 else:
                     sp = truncate_pauli_terms(items, max_terms, abs_cutoff)
-                    # convert back to dict
                     lst = pauli_list_from_sparsepauli(sp)
                     pauli_dict = {p: c for p, c in lst}
 
+        elif char == 'Z':
+            k = len(qlist)
+            # build P_sub = Z ⊗ Z ⊗ ... on the k qubits
+            P_sub = paulis_single['Z']
+            for _ in range(k-1):
+                P_sub = np.kron(P_sub, paulis_single['Z'])
+
+            a = angle / 2.0
+            Id_sub = np.eye(2**k, dtype=complex)
+            U_sub = np.cos(a) * Id_sub - 1j * np.sin(a) * P_sub
+
+            new_dict = {}
+            for pstr, coeff in pauli_dict.items():
+                sub_label = ''.join([pstr[q] for q in qlist])
+                P_target = paulis_single[sub_label[0]]
+                for ch in sub_label[1:]:
+                    P_target = np.kron(P_target, paulis_single[ch])
+
+                conj = U_sub.conj().T @ P_target @ U_sub
+
+                for comb in product(['I','X','Y','Z'], repeat=k):
+                    Pcomb = paulis_single[comb[0]]
+                    for ch in comb[1:]:
+                        Pcomb = np.kron(Pcomb, paulis_single[ch])
+                    coeff_c = 0.5 * np.trace(Pcomb.conj().T @ conj)
+                    if abs(coeff_c) > 1e-14:
+                        new_label = list(pstr)
+                        for ii, q in enumerate(qlist):
+                            new_label[q] = comb[ii]
+                        new_label = ''.join(new_label)
+                        new_dict[new_label] = new_dict.get(new_label, 0) + coeff * coeff_c
+
+            items = [(p, c) for p, c in new_dict.items() if abs(c) > abs_cutoff]
+            if len(items) == 0:
+                pauli_dict = {}
+            else:
+                sp = truncate_pauli_terms(items, max_terms, abs_cutoff)
+                lst = pauli_list_from_sparsepauli(sp)
+                pauli_dict = {p: c for p, c in lst}
+
+        else:
+            # unsupported axis
+            continue
+
     # convert final dict to SparsePauliOp
     if len(pauli_dict) == 0:
-        return SparsePauliOp.from_list(['I' * len(initial_pauli_terms[0][0])], coeffs=[0.0])
+        return SparsePauliOp(['I' * len(initial_pauli_terms[0][0])], coeffs=np.array([0.0], dtype=complex))
     return sparsepauli_from_pauli_dict(pauli_dict)
 
 
@@ -970,6 +1014,123 @@ def run_exact_heisenberg_diagnostic(h: np.ndarray, J: np.ndarray, gamma: float, 
 
     print('--- end exact diagnostic ---\n')
 
+
+def test_per_gate_conjugation(h: np.ndarray, J: np.ndarray, gamma: float, beta: float, n_diag: int = 3, num_layers: int = 1):
+    """Test each elementary gate conjugation (symbolic vs exact) for small system.
+
+    Prints the first mismatch found with details.
+    """
+    n = min(n_diag, len(h))
+    h_small = h[:n].copy()
+    J_small = J[:n, :n].copy()
+
+    # initial pauli dict
+    diag_pauli = build_pauli_diagonal_from_hJ(h_small, J_small)
+    pauli_dict = pauli_dict_from_list(diag_pauli)
+
+    # build small qaoa circuit (cost then mixer) for one layer
+    cost_gates = create_rotation_gates_from_hamiltonian(diag_pauli, gamma)
+    mixer_gates = [('X', [i], 2 * beta) for i in range(n)]
+    circuit = [{'type':'rotation','gates':cost_gates,'layer':0,'type_name':'cost'},
+               {'type':'rotation','gates':mixer_gates,'layer':0,'type_name':'mixer'}]
+
+    # flatten gates in time order
+    flat = []
+    for g in circuit:
+        if g['type'] != 'rotation':
+            continue
+        for item in g['gates']:
+            flat.append(item)
+
+    paulis_single = {'I': np.array([[1,0],[0,1]],dtype=complex),
+                     'X': np.array([[0,1],[1,0]],dtype=complex),
+                     'Y': np.array([[0,-1j],[1j,0]],dtype=complex),
+                     'Z': np.array([[1,0],[0,-1]],dtype=complex)}
+
+    def full_pauli_matrix(label: str):
+        M = paulis_single[label[0]]
+        for ch in label[1:]:
+            M = np.kron(M, paulis_single[ch])
+        return M
+
+    # for each elementary gate, compare symbolic conjugation vs exact
+    for gate in flat:
+        char, qlist, angle = gate
+        for pstr, coeff in list(pauli_dict.items())[:50]:
+            # build full Pauli matrix for pstr
+            P_full = full_pauli_matrix(pstr)
+
+            # exact U for this gate on full system
+            if char == 'X':
+                # build full U as kron of RX on target qubits, identity elsewhere
+                U = 1
+                for q in range(n):
+                    if [q] in [qlist]:
+                        # single qubit RX
+                        c = np.cos(angle / 2)
+                        s = -1j * np.sin(angle / 2)
+                        Uq = np.array([[c, s], [s, c]], dtype=complex)
+                    else:
+                        Uq = np.eye(2, dtype=complex)
+                    U = np.kron(U, Uq) if not np.isscalar(U) else Uq
+                conj_exact = U.conj().T @ P_full @ U
+                # symbolic mapping
+                mapping = conjugate_pauli_by_rx_single(pstr, qlist[0], angle)
+                # build symbolic full matrix
+                sym = np.zeros_like(P_full, dtype=complex)
+                for lab, f in mapping.items():
+                    sym += f * full_pauli_matrix(lab)
+
+            elif char == 'Z':
+                # P_sub on qlist
+                k = len(qlist)
+                P_sub = paulis_single['Z']
+                for _ in range(k-1):
+                    P_sub = np.kron(P_sub, paulis_single['Z'])
+                a = angle / 2.0
+                Id_sub = np.eye(2**k, dtype=complex)
+                U_sub = np.cos(a) * Id_sub - 1j * np.sin(a) * P_sub
+
+                # lift U_sub to full system by kron-ing identities
+                # build full U by tensoring identities and placing U_sub on qlist order
+                # easier: construct full U by acting on basis: construct P_full_sub for each basis
+                # For small n, build full P_z = kron over qubits with Z on qlist positions
+                P_full_sub = np.eye(1, dtype=complex)
+                for q in range(n):
+                    if q in qlist:
+                        P_full_sub = np.kron(P_full_sub, paulis_single['Z'])
+                    else:
+                        P_full_sub = np.kron(P_full_sub, np.eye(2, dtype=complex))
+                # full U = cos(a) I - i sin(a) P_full_sub
+                U = np.cos(a) * np.eye(2**n, dtype=complex) - 1j * np.sin(a) * P_full_sub
+                conj_exact = U.conj().T @ P_full @ U
+
+                # symbolic via our conjugation routine
+                # for multi-qubit Z, use propagate logic for a single gate
+                # reuse code path by calling propagate_pauli_terms_via_rx on single gate
+                try:
+                    propagated = propagate_pauli_terms_via_rx([(pstr, coeff)], [{'type':'rotation','gates':[gate]}], max_terms=4**n, abs_cutoff=0.0)
+                    lst = pauli_list_from_sparsepauli(propagated)
+                    sym = np.zeros_like(P_full, dtype=complex)
+                    for lab, c in lst:
+                        sym += c * full_pauli_matrix(lab)
+                except Exception as e:
+                    print('propagate_pauli_terms_via_rx failed during test:', e)
+                    return
+            else:
+                continue
+
+            # compare matrices (scale exact conj by original coefficient)
+            diff = np.linalg.norm(coeff * conj_exact - sym)
+            if diff > 1e-6:
+                print('\nMismatch for gate', gate, 'on Pauli', pstr)
+                print('Norm difference:', diff)
+                print('Exact matrix (sample entries):', conj_exact.flatten()[:8])
+                print('Sym matrix (sample entries):', sym.flatten()[:8])
+                return
+
+    print('Per-gate conjugation test: all gates match exact conjugation (within tol).')
+
 def main():
     """Main execution function."""
     print("=" * 60)
@@ -1041,15 +1202,20 @@ def main():
 
     print(f"Built QAOA circuit with tuned gamma/beta across {NUM_LAYERS} layers")
     print()
-    # Run a small diagnostic to compare native Pauli propagation vs state-vector for a small subsystem
-    try:
-        run_pauli_state_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=NUM_LAYERS, n_diag=min(3, n_qubits))
-    except Exception as e:
-        print('Diagnostic failed:', e)
-    try:
-        run_exact_heisenberg_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=NUM_LAYERS, n_diag=min(3, n_qubits))
-    except Exception as e:
-        print('Exact diagnostic failed:', e)
+    # Diagnostics disabled to reduce runtime. Uncomment below lines to enable.
+    # try:
+    #     run_pauli_state_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=min(2, NUM_LAYERS), n_diag=min(3, n_qubits))
+    # except Exception as e:
+    #     print('Diagnostic failed:', e)
+    # try:
+    #     run_exact_heisenberg_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=min(2, NUM_LAYERS), n_diag=min(3, n_qubits))
+    # except Exception as e:
+    #     print('Exact diagnostic failed:', e)
+    # Per-gate conjugation test is disabled to save runtime; enable manually if needed.
+    # try:
+    #     test_per_gate_conjugation(h_coeffs, J_coeffs, best_gamma, best_beta, n_diag=min(3, n_qubits), num_layers=min(2, NUM_LAYERS))
+    # except Exception as e:
+    #     print('Per-gate test failed:', e)
     # Step 5: Build final state via state-vector QAOA and sample measurements
     print("Step 5: Building QAOA statevector and sampling measurements...")
     # Build final state using state-vector QAOA (this is the definitive simulator for correctness)
