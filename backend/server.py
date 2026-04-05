@@ -5,7 +5,6 @@ Wraps qaoa_pauli_prop.py and exposes it as a REST API for the Flutter app.
 
 import sys
 import os
-import json
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -17,9 +16,8 @@ from qaoa_pauli_prop import (
     load_investment_data,
     construct_qubo_hamiltonian,
     hamiltonian_to_pauli_list,
-    create_rotation_gates_from_hamiltonian,
-    propagate_hamiltonian_through_circuit,
-    simulate,
+    optimize_gamma_beta,
+    statevector_qaoa,
     compute_objective,
 )
 
@@ -68,8 +66,6 @@ def run_simulation():
     risk_aversion = float(data.get('risk_aversion', 0.7))
     num_assets = int(data.get('num_assets', 8))
     num_layers = int(data.get('num_layers', 10))
-    max_terms = int(data.get('max_terms', 100))
-    abs_cutoff = float(data.get('abs_cutoff', 1e-6))
     noise_model = data.get('noise_model', 'none')
     noise_prob = float(data.get('noise_prob', 0.0))
     gamma_steps = int(data.get('gamma_steps', 7))
@@ -90,41 +86,33 @@ def run_simulation():
         # Step 3: Convert to Pauli terms
         pauli_terms = hamiltonian_to_pauli_list(h_coeffs, J_coeffs)
 
-        # Step 4: Tune gamma/beta via grid search
-        from qaoa_pauli_prop import optimize_gamma_beta
-        best_max, best_gamma, best_beta, best_results = optimize_gamma_beta(
+        # Step 4: Tune gamma/beta via grid search (using statevector, same as script)
+        best_max, best_gamma, best_beta, _ = optimize_gamma_beta(
             pauli_terms, n_qubits, num_layers, mu, sigma,
             gamma_steps=gamma_steps, beta_steps=beta_steps, shots=None,
-            noise_model=noise_model, noise_prob=noise_prob
+            noise_model=noise_model, noise_prob=noise_prob,
         )
 
-        # Step 5: Build final circuit with tuned params
-        cost_gates = create_rotation_gates_from_hamiltonian(pauli_terms, best_gamma)
-        mixer_gates = [('X', [i], 2 * best_beta) for i in range(n_qubits)]
+        # Step 5: Build final statevector with tuned params (same as script's main())
+        state = statevector_qaoa(mu, sigma, best_gamma, best_beta, num_layers)
 
-        qaoa_circuit = []
-        for layer in range(num_layers):
-            qaoa_circuit.append({
-                'type': 'rotation',
-                'gates': cost_gates,
-                'layer': layer,
-                'type_name': 'cost'
-            })
-            qaoa_circuit.append({
-                'type': 'rotation',
-                'gates': mixer_gates,
-                'layer': layer,
-                'type_name': 'mixer'
-            })
-
-        # Step 6: Propagate
-        propagated_terms = propagate_hamiltonian_through_circuit(
-            pauli_terms, qaoa_circuit, max_terms
-        )
-
-        # Step 7: Simulate
-        results = simulate(propagated_terms, n_qubits, shots=shots,
-                          noise_model=noise_model, noise_prob=noise_prob)
+        # Step 6: Sample from the real QAOA probability distribution
+        probs = np.abs(state) ** 2
+        if noise_model == 'none' or noise_prob <= 0.0:
+            counts = np.random.multinomial(shots, probs)
+            results = {format(i, f'0{n_qubits}b'): float(c) / shots
+                       for i, c in enumerate(counts) if c > 0}
+        else:
+            sampled = np.random.choice(2 ** n_qubits, size=shots, p=probs)
+            noisy_counts: dict = {}
+            for idx in sampled:
+                bitstr = list(format(int(idx), f'0{n_qubits}b'))
+                for qi in range(n_qubits):
+                    if np.random.random() < noise_prob:
+                        bitstr[qi] = '1' if bitstr[qi] == '0' else '0'
+                noisy = ''.join(bitstr)
+                noisy_counts[noisy] = noisy_counts.get(noisy, 0) + 1
+            results = {bs: cnt / shots for bs, cnt in noisy_counts.items()}
 
         # Step 8: Build response
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
@@ -187,6 +175,7 @@ def run_simulation():
 
     except Exception as e:
         import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e),
