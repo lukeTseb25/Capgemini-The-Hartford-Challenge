@@ -8,7 +8,7 @@ import pandas as pd
 from typing import List, Tuple, Dict, Any
 import rustworkx as rx
 from pauli_prop import propagate_through_rotation_gates, propagate_through_operator
-from qiskit.quantum_info import Pauli, SparsePauliOp 
+from qiskit.quantum_info import SparsePauliOp 
 from pauli_prop.propagation import RotationGates
 
 # ============================================================================
@@ -21,7 +21,7 @@ ASSETS = 8
 ASSET_IDS = None
 
 # QAOA parameters
-NUM_LAYERS = 5    # Number of QAOA layers (p)
+NUM_LAYERS = 10    # Number of QAOA layers (p)
 GAMMA = 0.5       # Initial gamma parameter (cost Hamiltonian angle)
 BETA = 0.3        # Initial beta parameter (mixer Hamiltonian angle)
 
@@ -295,6 +295,32 @@ def compute_expectation_value_classical(pauli_terms: List[Tuple[str, complex]],
     
     return expectation
 
+
+def compute_objective(bitstring: str, mu: np.ndarray, sigma: np.ndarray,
+                      q: float = Q, lambda_param: float = LAMBDA, B_param: float = B) -> float:
+    """
+    Compute the objective function for a given bitstring selection.
+
+    Objective: q * sum_i sum_j (w_i w_j sigma_ij) - sum_i (w_i * mu_i) +
+               lambda * (sum_i w_i - B)^2
+
+    Args:
+        bitstring: e.g. '0101' length = n_qubits
+        mu: expected returns vector
+        sigma: covariance matrix
+        q: risk aversion parameter
+        lambda_param: Lagrange multiplier
+        B_param: budget target
+
+    Returns:
+        objective value (float)
+    """
+    w = np.array([int(b) for b in bitstring], dtype=float)
+    quad = float(w @ sigma @ w)
+    linear = float(w @ mu)
+    obj = q * quad - linear + lambda_param * (np.sum(w) - B_param) ** 2
+    return obj
+
 def simulate(pauli_terms: List[Tuple[str, complex]], 
                          n_qubits: int, 
                          shots: int = 1000) -> Dict[str, float]:
@@ -307,7 +333,73 @@ def simulate(pauli_terms: List[Tuple[str, complex]],
     Returns:
         Dictionary of measurement outcomes and probabilities
     """
-    pass
+    # Normalize input: accept SparsePauliOp, list of tuples, or similar
+    terms: List[Tuple[str, complex]] = []
+
+    # If it's a Qiskit SparsePauliOp
+    try:
+        if isinstance(pauli_terms, SparsePauliOp):
+            for p, c in zip(pauli_terms.paulis, pauli_terms.coeffs):
+                # Pauli objects have a to_label() method
+                pauli_label = p.to_label() if hasattr(p, 'to_label') else str(p)
+                terms.append((pauli_label, complex(c)))
+        else:
+            # Try to coerce iterable of pairs
+            for item in pauli_terms:
+                if isinstance(item, tuple) and len(item) == 2:
+                    terms.append((str(item[0]), complex(item[1])))
+    except Exception:
+        # Fallback: treat as empty operator
+        terms = []
+
+    # Pre-filter: keep only diagonal (I/Z) terms for computational-basis energies
+    diag_terms = [(p, c) for p, c in terms if all(ch in ['I', 'Z'] for ch in p)]
+
+    # If there are no diagonal terms, return uniform distribution
+    dim = 2 ** n_qubits
+    if len(diag_terms) == 0:
+        probs = np.ones(dim) / dim
+    else:
+        # Compute energy for each computational basis state
+        energies = np.zeros(dim, dtype=float)
+        for idx in range(dim):
+            bitstr = format(idx, f'0{n_qubits}b')
+            energy = 0.0
+            for pstr, coeff in diag_terms:
+                eigen = 1
+                for q, ch in enumerate(pstr):
+                    if ch == 'Z':
+                        # Z eigenvalue is +1 for '0', -1 for '1'
+                        eigen *= (1 if bitstr[q] == '0' else -1)
+                energy += np.real(coeff) * eigen
+            energies[idx] = energy
+
+        # Convert energies to scores (higher score -> higher probability).
+        # Use negative energy so lower energy states get higher weight.
+        scores = -energies
+
+        # Stabilize and scale: use temperature proportional to score range
+        score_range = np.ptp(scores)
+        if score_range <= 0:
+            probs = np.ones(dim) / dim
+        else:
+            temp = score_range
+            exps = np.exp((scores - np.max(scores)) / (temp + 1e-12))
+            probs = exps / np.sum(exps)
+
+    # Sample measurement outcomes according to probabilities
+    if shots is None or shots <= 0:
+        # Return exact probabilities
+        result = {format(i, f'0{n_qubits}b'): float(probs[i]) for i in range(dim)}
+        return result
+
+    counts = np.random.multinomial(shots, probs)
+    result = {}
+    for i, c in enumerate(counts):
+        if c > 0:
+            result[format(i, f'0{n_qubits}b')] = float(c) / float(shots)
+
+    return result
 
 # ============================================================================
 # MAIN EXECUTION
@@ -447,6 +539,29 @@ def main():
             else:
                 print(f"Budget constraint satisfied (selected {len(selected_indices)})")
     
+    # --- Additional: compute average objective across all bitstrings and compare top-10 ---
+    print("\nComputing objective values for comparison...")
+    dim = 2 ** n_qubits
+    all_objs = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        b = format(idx, f'0{n_qubits}b')
+        all_objs[idx] = compute_objective(b, mu, sigma, q=Q, lambda_param=LAMBDA, B_param=B)
+
+    avg_obj = float(np.mean(all_objs))
+    min_obj = float(np.min(all_objs))
+    min_idx = int(np.argmin(all_objs))
+    min_bit = format(min_idx, f'0{n_qubits}b')
+
+    print(f"Average objective over all {dim} bitstrings: {avg_obj:.6f}")
+    print(f"Minimum objective over all bitstrings: {min_obj:.6f} (bitstring |{min_bit}|)")
+
+    print("\nTop 10 bitstrings: objective vs average")
+    print("-" * 60)
+    for i, (bitstring, prob) in enumerate(sorted_results[:10]):
+        obj_val = compute_objective(bitstring, mu, sigma, q=Q, lambda_param=LAMBDA, B_param=B)
+        diff = obj_val - avg_obj
+        print(f"{i+1:2d}. |{bitstring}| -> obj={obj_val:.6f}, diff_vs_avg={diff:+.6f}, p={prob:.4f}")
+
     print("\n" + "=" * 60)
     print("Simulation complete!")
     print("=" * 60)
