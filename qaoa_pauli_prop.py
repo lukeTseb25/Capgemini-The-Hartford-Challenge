@@ -1,5 +1,5 @@
 """
-QAOA Hamiltonian Simulation with Pauli Propagation and Bloqade SQUIN
+QAOA Hamiltonian Simulation with Pauli Propagation
 For portfolio optimization with QUBO formulation.
 """
 
@@ -10,15 +10,6 @@ import rustworkx as rx
 from pauli_prop import propagate_through_rotation_gates, propagate_through_operator
 from qiskit.quantum_info import Pauli, SparsePauliOp 
 from pauli_prop.propagation import RotationGates
-    
-
-# Try to import Bloqade (if available)
-try:
-    from bloqade.analog import *
-    BLOQADE_AVAILABLE = True
-except ImportError:
-    print("Warning: Bloqade not installed. Using fallback simulation.")
-    BLOQADE_AVAILABLE = False
 
 # ============================================================================
 # CONSTANT PARAMETERS (Set these at the beginning)
@@ -97,7 +88,6 @@ def construct_qubo_hamiltonian(mu: np.ndarray, sigma: np.ndarray,
         q: Risk aversion parameter
     
     Returns:
-        Q: QUBO matrix (N x N)
         h: Linear coefficients for Ising model
         J: Quadratic coefficients for Ising model
     """
@@ -305,16 +295,10 @@ def compute_expectation_value_classical(pauli_terms: List[Tuple[str, complex]],
     
     return expectation
 
-# ============================================================================
-# BLOQADE SQUIN SIMULATION
-# ============================================================================
-
-def simulate_with_bloqade(pauli_terms: List[Tuple[str, complex]], 
+def simulate(pauli_terms: List[Tuple[str, complex]], 
                          n_qubits: int, 
                          shots: int = 1000) -> Dict[str, float]:
     """
-    Simulate quantum circuit using Bloqade's SQUIN engine.
-    
     Args:
         pauli_terms: List of (pauli_string, coefficient)
         n_qubits: Number of qubits
@@ -323,92 +307,7 @@ def simulate_with_bloqade(pauli_terms: List[Tuple[str, complex]],
     Returns:
         Dictionary of measurement outcomes and probabilities
     """
-    if not BLOQADE_AVAILABLE:
-        print("Bloqade not available. Using classical simulation fallback.")
-        return classical_simulation_fallback(pauli_terms, n_qubits)
-    
-    try:
-        # Initialize Bloqade simulation
-        simulator = start(np.array([[0, 1, 2, 3, 4, 5, 6, 7],[0, 0, 0, 0, 0, 0, 0, 0]]))
-        
-        # Create a register of atoms
-        lattice = Square(int(np.ceil(np.sqrt(n_qubits))), int(np.ceil(np.sqrt(n_qubits))))
-        register = simulator.rydberg.rydberg.register(lattice)
-        
-        # Add Hamiltonian terms as Rydberg interactions
-        # Map Pauli Z terms to local detuning
-        for pauli_str, coeff in pauli_terms:
-            if 'Z' in pauli_str:
-                z_qubits = [i for i, p in enumerate(pauli_str) if p == 'Z']
-                
-                if len(z_qubits) == 1:
-                    # Single Z term -> local detuning
-                    q = z_qubits[0]
-                    if q < n_qubits:
-                        register.rydberg.detuning.local[q] = np.real(coeff)
-                elif len(z_qubits) == 2:
-                    # ZZ term -> effective interaction
-                    q1, q2 = z_qubits
-                    if q1 < n_qubits and q2 < n_qubits:
-                        register.rydberg.detuning.local[q1] += np.real(coeff)
-                        register.rydberg.detuning.local[q2] += np.real(coeff)
-        
-        # Run simulation
-        results = register.simulate(
-            rydberg_rabi=waveform.constant(1.0, 1000),
-            samples=shots
-        )
-        
-        # Process results
-        outcomes = {}
-        for sample in results.samples:
-            bitstring = ''.join(str(int(atom)) for atom in sample[:n_qubits])
-            outcomes[bitstring] = outcomes.get(bitstring, 0) + 1
-        
-        # Convert to probabilities
-        probabilities = {bs: count/shots for bs, count in outcomes.items()}
-        
-        return probabilities
-        
-    except Exception as e:
-        print(f"Bloqade simulation failed: {e}")
-        return classical_simulation_fallback(pauli_terms, n_qubits)
-
-def classical_simulation_fallback(pauli_terms: List[Tuple[str, complex]], 
-                                 n_qubits: int) -> Dict[str, float]:
-    """
-    Classical fallback simulation when Bloqade is unavailable.
-    """
-    # For diagonal operators, we can compute exact probabilities
-    probabilities = {}
-    
-    # Only for small systems (n_qubits <= 8)
-    if n_qubits <= 8:
-        # Compute energy for each basis state
-        energies = {}
-        for i in range(2**n_qubits):
-            bitstring = format(i, f'0{n_qubits}b')
-            
-            # Compute eigenvalue for this basis state
-            energy = 0.0
-            for term in pauli_terms:
-                eigenvalue = 1.0
-                for q, p in enumerate(term.paulis[0]):
-                    if q >= n_qubits:
-                        continue
-                    if p == 'Z':
-                        eigenvalue *= (1.0 if bitstring[q] == '0' else -1.0)
-                energy += np.real(term.coeffs[0] * eigenvalue)
-            
-            energies[bitstring] = energy
-        
-        # Boltzmann distribution (inverse temperature beta=1)
-        beta = 1.0
-        Z = sum(np.exp(-beta * e) for e in energies.values())
-        for bitstring, energy in energies.items():
-            probabilities[bitstring] = np.exp(-beta * energy) / Z
-    
-    return probabilities
+    pass
 
 # ============================================================================
 # MAIN EXECUTION
@@ -422,7 +321,6 @@ def main():
     print(f"Parameters: lambda={LAMBDA}, B={B}, q={Q}")
     print(f"QAOA layers: {NUM_LAYERS}")
     print(f"Pauli propagation: max_terms={MAX_TERMS}, cutoff={ABS_CUTOFF}")
-    print(f"Bloqade available: {BLOQADE_AVAILABLE}")
     print()
     
     # Step 1: Load data
@@ -499,8 +397,8 @@ def main():
     if len(sorted_terms) > 10:
         print(f"  ... and {len(sorted_terms)-10} more terms")
     
-    print("Step 6: Simulating with Bloqade SQUIN...")
-    results = simulate_with_bloqade(propagated_terms, n_qubits, shots=1000)
+    print("Step 6: Simulating...s")
+    results = simulate(propagated_terms, n_qubits, shots=1000)
     
     # Step 7: Display results
     print("\n" + "=" * 60)
