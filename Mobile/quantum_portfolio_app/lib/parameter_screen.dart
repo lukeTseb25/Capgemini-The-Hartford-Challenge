@@ -11,13 +11,13 @@ class ParameterScreen extends StatefulWidget {
 
 class _ParameterScreenState extends State<ParameterScreen> {
   // QUBO parameters
-  double _lambda = 3.0;
+  double _lambda = 0.1;
   double _budget = 4.0;
   double _riskAversion = 0.7;
   int _numAssets = 8;
 
   // QAOA parameters
-  int _numLayers = 15;
+  int _numLayers = 10;
   int _maxTerms = 100;
   final double _absCutoff = 1e-6;
 
@@ -166,7 +166,7 @@ class _ParameterScreenState extends State<ParameterScreen> {
           'Lambda',
           _lambda,
           0.01,
-          10.0,
+          0.5,
           (v) => setState(() => _lambda = double.parse(v.toStringAsFixed(2))),
           decimals: 2,
         ),

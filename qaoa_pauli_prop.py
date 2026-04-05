@@ -193,6 +193,16 @@ def truncate_pauli_terms(pauli_terms: List[Tuple[str, complex]],
         sel_coeffs = coeffs[sorted_idxs]
         return SparsePauliOp(sel_lbls, coeffs=sel_coeffs)
 
+    # tuple returned by pauli-prop: (paulis_array, coeffs_array, ...)
+    if isinstance(pauli_terms, tuple):
+        try:
+            pauli_arr = pauli_terms[0]
+            coeffs_arr = np.array(pauli_terms[1], dtype=complex)
+            sp = SparsePauliOp(pauli_arr, coeffs=coeffs_arr)
+            return truncate_pauli_terms(sp, max_terms, abs_cutoff)
+        except Exception:
+            pass
+
     # unknown type -> return input unchanged
     return pauli_terms
 
@@ -251,14 +261,9 @@ def propagate_hamiltonian_through_circuit(initial_pauli_terms: List[Tuple[str, c
     
     # For each gate in the circuit
     for gate in circuit_gates:
-        # If current_terms accidentally is a tuple returned by pauli-prop, try to convert
+        # If current_terms is a tuple (SparsePauliOp, trunc_onenorm), unwrap it
         if isinstance(current_terms, tuple):
-            try:
-                pauli_arr = current_terms[0]
-                coeffs = current_terms[1]
-                current_terms = SparsePauliOp(pauli_arr, coeffs=np.array(coeffs, dtype=complex))
-            except Exception:
-                pass
+            current_terms = current_terms[0]
         if gate['type'] == 'rotation':
             # Propagate through rotation gates
             # gate['gates'] is a list of tuples (pauli_char, qubits, angle)
@@ -279,14 +284,9 @@ def propagate_hamiltonian_through_circuit(initial_pauli_terms: List[Tuple[str, c
                 atol=ABS_CUTOFF,
                 frame='s'
             )
-            # propagate_through_rotation_gates may return a tuple (paulis, coeffs, ...)
+            # propagate_through_rotation_gates returns (SparsePauliOp, trunc_onenorm)
             if isinstance(res, tuple):
-                try:
-                    pauli_arr = res[0]
-                    coeffs = res[1]
-                    current_terms = SparsePauliOp(pauli_arr, coeffs=np.array(coeffs, dtype=complex))
-                except Exception:
-                    current_terms = res
+                current_terms = res[0]
             else:
                 current_terms = res
         elif gate['type'] == 'operator':
