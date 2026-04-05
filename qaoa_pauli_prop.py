@@ -14,7 +14,7 @@ from pauli_prop.propagation import RotationGates
 
 # Try to import Bloqade (if available)
 try:
-    from bloqade.analog import *
+    from bloqade import start
     BLOQADE_AVAILABLE = True
 except ImportError:
     print("Warning: Bloqade not installed. Using fallback simulation.")
