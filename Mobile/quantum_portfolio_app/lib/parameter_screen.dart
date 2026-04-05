@@ -11,21 +11,21 @@ class ParameterScreen extends StatefulWidget {
 
 class _ParameterScreenState extends State<ParameterScreen> {
   // QUBO parameters
-  double _lambda = 0.1;
+  double _lambda = 3.0;
   double _budget = 4.0;
   double _riskAversion = 0.7;
   int _numAssets = 8;
 
   // QAOA parameters
-  int _numLayers = 10;
+  int _numLayers = 15;
   int _maxTerms = 100;
   final double _absCutoff = 1e-6;
 
   // Simulation parameters
   String _noiseModel = 'none';
   double _noiseProb = 0.0;
-  int _gammaSteps = 7;
-  int _betaSteps = 7;
+  int _gammaSteps = 10;
+  int _betaSteps = 10;
   int _shots = 1000;
 
   bool _isRunning = false;
@@ -166,7 +166,7 @@ class _ParameterScreenState extends State<ParameterScreen> {
           'Lambda',
           _lambda,
           0.01,
-          2.0,
+          10.0,
           (v) => setState(() => _lambda = double.parse(v.toStringAsFixed(2))),
           decimals: 2,
         ),
