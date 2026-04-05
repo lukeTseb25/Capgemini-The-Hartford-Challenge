@@ -458,38 +458,41 @@ def sparsepauli_from_pauli_dict(pauli_dict: Dict[str, complex]) -> SparsePauliOp
 
 def conjugate_pauli_by_rx_single(pauli_str: str, qubit: int, theta: float) -> Dict[str, complex]:
     """Return mapping of Pauli strings after conjugation by RX(theta) on `qubit`.
-    U = RX(theta) = exp(-i theta X / 2); we compute U^† P U.
-    Rules:
-        Z -> cos(theta) * Z + sin(theta) * Y
-        Y -> cos(theta) * Y - sin(theta) * Z
-        X -> X, I -> I
+
+    Compute coefficients exactly by working with 2x2 matrices on the target qubit:
+        a_k = 0.5 * Tr(P_k^† U^† P_q U)
+    where P_k in {I,X,Y,Z}.
+    This captures phases and is robust for multi-qubit Pauli strings.
     """
-    ch = pauli_str[qubit]
-    c = np.cos(theta)
-    s = np.sin(theta)
+    # single-qubit Pauli matrices
+    I = np.array([[1, 0], [0, 1]], dtype=complex)
+    X = np.array([[0, 1], [1, 0]], dtype=complex)
+    Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    Z = np.array([[1, 0], [0, -1]], dtype=complex)
+    pauli_map = {'I': I, 'X': X, 'Y': Y, 'Z': Z}
+
+    # Build single-qubit RX operator consistent with apply_rx_to_state (theta is full angle)
+    c = np.cos(theta / 2)
+    s = -1j * np.sin(theta / 2)
+    U = np.array([[c, s], [s, c]], dtype=complex)
+
+    target = pauli_str[qubit]
+    P_target = pauli_map.get(target, I)
+
+    # compute U^† P_target U
+    conj = U.conj().T @ P_target @ U
+
     out = {}
-    if ch == 'I' or ch == 'X':
-        out[pauli_str] = 1.0
-        return out
+    # express conj as linear combination of I,X,Y,Z using Hilbert-Schmidt inner product
+    for lab, Pmat in pauli_map.items():
+        coeff = 0.5 * np.trace(Pmat.conj().T @ conj)
+        if abs(coeff) > 1e-14:
+            new_label = pauli_str[:qubit] + lab + pauli_str[qubit+1:]
+            out[new_label] = complex(coeff)
 
-    if ch == 'Z':
-        # Z -> c*Z + s*Y
-        s1 = pauli_str[:qubit] + 'Z' + pauli_str[qubit+1:]
-        s2 = pauli_str[:qubit] + 'Y' + pauli_str[qubit+1:]
-        out[s1] = c
-        out[s2] = s
-        return out
-
-    if ch == 'Y':
-        # Y -> c*Y - s*Z
-        s1 = pauli_str[:qubit] + 'Y' + pauli_str[qubit+1:]
-        s2 = pauli_str[:qubit] + 'Z' + pauli_str[qubit+1:]
-        out[s1] = c
-        out[s2] = -s
-        return out
-
-    # Fallback: unchanged
-    out[pauli_str] = 1.0
+    # If nothing significant, return original
+    if not out:
+        return {pauli_str: 1.0}
     return out
 
 
@@ -865,6 +868,108 @@ def run_pauli_state_diagnostic(h: np.ndarray, J: np.ndarray, gamma: float, beta:
 
     print('--- end diagnostic ---\n')
 
+
+def run_exact_heisenberg_diagnostic(h: np.ndarray, J: np.ndarray, gamma: float, beta: float, num_layers: int = 1, n_diag: int = 2):
+    """Exact-matrix Heisenberg diagnostic: compute U^† H U exactly (no truncation)
+
+    Decompose the resulting operator into Pauli basis and compare with the
+    sparse/native propagation result to locate mismatches.
+    """
+    n = min(n_diag, len(h))
+    h_small = h[:n].copy()
+    J_small = J[:n, :n].copy()
+
+    dim = 2 ** n
+    # classical cost diagonal
+    Cvals = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        bits = format(idx, f'0{n}b')
+        s = np.array([1 - 2 * int(b) for b in bits], dtype=float)
+        quad = 0.0
+        for i in range(n):
+            for j in range(i+1, n):
+                quad += J_small[i, j] * s[i] * s[j]
+        lin = float(np.dot(h_small, s))
+        Cvals[idx] = quad + lin
+
+    # H as diagonal matrix
+    H = np.diag(Cvals)
+
+    # Build full mixer unitary for one layer: tensor product of RX(2*beta)
+    def single_rx(theta):
+        c = np.cos(theta / 2)
+        s = -1j * np.sin(theta / 2)
+        return np.array([[c, s], [s, c]], dtype=complex)
+
+    # Build total mixer M_total = M_L ... M_1 (product of per-layer mixer unitaries)
+    M_total = np.eye(dim, dtype=complex)
+    for layer in range(num_layers):
+        theta = 2 * beta
+        # full mixer = kron(RX, RX, ...)
+        M = single_rx(theta)
+        full_mixer = M
+        for _ in range(n - 1):
+            full_mixer = np.kron(full_mixer, M)
+        # cost diagonal commutes with H; still follow original sequence: U_layer = full_mixer @ diag_cost
+        diag_cost = np.diag(np.exp(-1j * gamma * Cvals))
+        U_layer = full_mixer @ diag_cost
+        M_total = U_layer @ M_total
+
+    # Exact propagated H' = U_total^† H U_total
+    U_total = M_total
+    Hprop = U_total.conj().T @ H @ U_total
+
+    # plus state
+    plus = np.ones(dim, dtype=complex) / np.sqrt(dim)
+    exp_exact = float(np.real(np.vdot(plus, Hprop @ plus)))
+
+    # Decompose Hprop into Pauli basis
+    paulis = {'I': np.array([[1,0],[0,1]],dtype=complex),
+              'X': np.array([[0,1],[1,0]],dtype=complex),
+              'Y': np.array([[0,-1j],[1j,0]],dtype=complex),
+              'Z': np.array([[1,0],[0,-1]],dtype=complex)}
+
+    pauli_coeffs = []
+    for mask in range(4 ** n):
+        # MSB-first base-4 digits so label[0] refers to qubit 0 (leftmost)
+        digits = [ (mask // (4 ** (n - 1 - i))) % 4 for i in range(n) ]
+        lab = [ ['I','X','Y','Z'][d] for d in digits ]
+        # build tensor product in qubit order: P0 ⊗ P1 ⊗ ...
+        P = paulis[lab[0]]
+        for k in range(1, n):
+            P = np.kron(P, paulis[lab[k]])
+        label = ''.join(lab)
+        coeff = np.trace(P @ Hprop) / float(dim)
+        if abs(coeff) > 1e-12:
+            pauli_coeffs.append((label, complex(coeff)))
+
+    # Compute sparse/native propagated operator for comparison
+    diag_pauli = build_pauli_diagonal_from_hJ(h_small, J_small)
+    # Build small qaoa circuit of mixers only (propagate_pauli_terms_via_rx skips cost gates)
+    qaoa_small = []
+    for layer in range(num_layers):
+        qaoa_small.append({'type':'rotation','gates':[('X',[i],2*beta) for i in range(n)],'layer':layer,'type_name':'mixer'})
+    propagated = propagate_pauli_terms_via_rx(diag_pauli, qaoa_small, max_terms=4**n, abs_cutoff=0.0)
+
+    # Decompose propagated SparsePauliOp into list
+    try:
+        propagated_list = pauli_list_from_sparsepauli(propagated)
+    except Exception:
+        propagated_list = list(diag_pauli)
+
+    print('\n--- Exact Heisenberg Diagnostic (n=%d, layers=%d) ---' % (n, num_layers))
+    print('State-vector expectation (small):', float(np.sum((np.abs((U_total @ plus))**2) * Cvals)))
+    print('Exact <+|U^† H U|+>:', exp_exact)
+    print('\nTop exact Pauli coefficients:')
+    for lab, c in sorted(pauli_coeffs, key=lambda x: -abs(x[1]))[:16]:
+        print('  ', lab, c)
+
+    print('\nTop propagated (native) coefficients:')
+    for lab, c in sorted(propagated_list, key=lambda x: -abs(x[1]))[:16]:
+        print('  ', lab, c)
+
+    print('--- end exact diagnostic ---\n')
+
 def main():
     """Main execution function."""
     print("=" * 60)
@@ -941,6 +1046,10 @@ def main():
         run_pauli_state_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=NUM_LAYERS, n_diag=min(3, n_qubits))
     except Exception as e:
         print('Diagnostic failed:', e)
+    try:
+        run_exact_heisenberg_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=NUM_LAYERS, n_diag=min(3, n_qubits))
+    except Exception as e:
+        print('Exact diagnostic failed:', e)
     # Step 5: Build final state via state-vector QAOA and sample measurements
     print("Step 5: Building QAOA statevector and sampling measurements...")
     # Build final state using state-vector QAOA (this is the definitive simulator for correctness)
