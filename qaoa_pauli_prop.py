@@ -342,36 +342,41 @@ def simulate_with_bloqade(pauli_terms: List[Tuple[str, complex]],
         return classical_simulation_fallback(pauli_terms, n_qubits)
     
     try:
-        # Initialize Bloqade simulation
-        simulator = start(np.array([[0, 1, 2, 3, 4, 5, 6, 7],[0, 0, 0, 0, 0, 0, 0, 0]]))
-        
-        # Create a register of atoms
-        lattice = Square(int(np.ceil(np.sqrt(n_qubits))), int(np.ceil(np.sqrt(n_qubits))))
-        register = simulator.rydberg.rydberg.register(lattice)
-        
-        # Add Hamiltonian terms as Rydberg interactions
-        # Map Pauli Z terms to local detuning
+        # Extract h and J from pauli_terms
+        h = np.zeros(n_qubits)
+        J = np.zeros((n_qubits, n_qubits))
         for pauli_str, coeff in pauli_terms:
-            if 'Z' in pauli_str:
-                z_qubits = [i for i, p in enumerate(pauli_str) if p == 'Z']
-                
-                if len(z_qubits) == 1:
-                    # Single Z term -> local detuning
-                    q = z_qubits[0]
-                    if q < n_qubits:
-                        register.rydberg.detuning.local[q] = np.real(coeff)
-                elif len(z_qubits) == 2:
-                    # ZZ term -> effective interaction
-                    q1, q2 = z_qubits
-                    if q1 < n_qubits and q2 < n_qubits:
-                        register.rydberg.detuning.local[q1] += np.real(coeff)
-                        register.rydberg.detuning.local[q2] += np.real(coeff)
+            qubits = [i for i, p in enumerate(pauli_str) if p == 'Z']
+            if len(qubits) == 1:
+                h[qubits[0]] = np.real(coeff)
+            elif len(qubits) == 2:
+                i, j = qubits
+                J[i, j] = np.real(coeff)
+                J[j, i] = np.real(coeff)
         
-        # Run simulation
-        results = register.simulate(
-            rydberg_rabi=waveform.constant(1.0, 1000),
-            samples=shots
-        )
+        # Create positions for atoms (linear chain with 5 micron spacing)
+        positions = [(i * 5.0, 0.0) for i in range(n_qubits)]
+        
+        # Build the program
+        program = start.rydberg.register(positions)
+        
+        # Set local detunings
+        for i in range(n_qubits):
+            delta = -2 * h[i] - 2 * np.sum(J[i, :])
+            program = program.rydberg.detuning.local[i].constant(delta, 1.0)
+        
+        # Set interactions
+        for i in range(n_qubits):
+            for j in range(i+1, n_qubits):
+                if abs(J[i, j]) > 1e-10:
+                    V = 4 * J[i, j]
+                    program = program.rydberg_interaction.local[(i, j)].constant(V, 1.0)
+        
+        # No Rabi driving for ground state
+        program = program.rabi.amplitude.uniform.constant(0.0, 1.0)
+        
+        # Run ground state simulation
+        results = program.run(method='ground_state', shots=shots)
         
         # Process results
         outcomes = {}
@@ -380,7 +385,7 @@ def simulate_with_bloqade(pauli_terms: List[Tuple[str, complex]],
             outcomes[bitstring] = outcomes.get(bitstring, 0) + 1
         
         # Convert to probabilities
-        probabilities = {bs: count/shots for bs, count in outcomes.items()}
+        probabilities = {bs: count / shots for bs, count in outcomes.items()}
         
         return probabilities
         
@@ -405,14 +410,12 @@ def classical_simulation_fallback(pauli_terms: List[Tuple[str, complex]],
             
             # Compute eigenvalue for this basis state
             energy = 0.0
-            for term in pauli_terms:
+            for pauli_str, coeff in pauli_terms:
                 eigenvalue = 1.0
-                for q, p in enumerate(term.paulis[0]):
-                    if q >= n_qubits:
-                        continue
+                for q, p in enumerate(pauli_str):
                     if p == 'Z':
                         eigenvalue *= (1.0 if bitstring[q] == '0' else -1.0)
-                energy += np.real(term.coeffs[0] * eigenvalue)
+                energy += np.real(coeff * eigenvalue)
             
             energies[bitstring] = energy
         
