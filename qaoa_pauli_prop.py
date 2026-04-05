@@ -10,6 +10,7 @@ import rustworkx as rx
 from pauli_prop import propagate_through_rotation_gates, propagate_through_operator
 from qiskit.quantum_info import SparsePauliOp 
 from pauli_prop.propagation import RotationGates
+from math import cos, sin
 
 # ============================================================================
 # CONSTANT PARAMETERS (Set these at the beginning)
@@ -32,6 +33,8 @@ BETA = 0.3        # Initial beta parameter (mixer Hamiltonian angle)
 # Pauli propagation parameters
 MAX_TERMS = 100   # Maximum number of Pauli terms to keep
 ABS_CUTOFF = 1e-6 # Absolute coefficient cutoff for truncation
+# Bit ordering for mask ↔ bitstring conversions. Will be auto-detected.
+BIT_ORDER_MSB_FIRST = True
 
 # ============================================================================
 # DATA LOADING AND PROCESSING
@@ -161,20 +164,37 @@ def truncate_pauli_terms(pauli_terms: List[Tuple[str, complex]],
     Returns:
         Truncated list of Pauli terms
     """
-    # Filter by absolute cutoff
-    # Arrange paulis and coeffs into a list of tuples
-    pcs = [(p, c) for p, c in zip(pauli_terms[0].paulis, pauli_terms[0].coeffs)]
-    filtered = [(p, c) for p, c in pcs if abs(c) > abs_cutoff]
-    
-	# Make filtered into an Operator object
-    filtered = SparsePauliOp([p for p, c in filtered], coeffs=np.array([c for p, c in filtered], dtype=complex))
+    # Accept either a SparsePauliOp or a list of (pauli_label, coeff)
+    if isinstance(pauli_terms, SparsePauliOp):
+        sp = pauli_terms
+        coeffs = np.array(sp.coeffs, dtype=complex)
+        # filter by absolute cutoff
+        mask = np.abs(coeffs) > abs_cutoff
+        if not np.any(mask):
+            # nothing passes cutoff; return the original operator unchanged
+            return pauli_terms
+        idxs = np.where(mask)[0]
+        # sort by magnitude and keep top max_terms
+        sorted_idxs = idxs[np.argsort(np.abs(coeffs[idxs]))[::-1]
+                           [:max_terms]]
+        return SparsePauliOp(sp.paulis[sorted_idxs], coeffs=coeffs[sorted_idxs])
 
-    # Sort by magnitude and keep top max_terms
-    if len(filtered) > max_terms:
-        filtered.sort(key=lambda x: abs(x[1]), reverse=True)
-        filtered = filtered[:max_terms]
-    
-    return filtered
+    # list of tuples
+    if isinstance(pauli_terms, list):
+        lbls = [p for p, c in pauli_terms]
+        coeffs = np.array([c for p, c in pauli_terms], dtype=complex)
+        mask = np.abs(coeffs) > abs_cutoff
+        if not np.any(mask):
+            # nothing passes cutoff; return operator built from all terms
+            return SparsePauliOp(lbls, coeffs)
+        idxs = np.where(mask)[0]
+        sorted_idxs = idxs[np.argsort(np.abs(coeffs[idxs]))[::-1][:max_terms]]
+        sel_lbls = [lbls[i] for i in sorted_idxs]
+        sel_coeffs = coeffs[sorted_idxs]
+        return SparsePauliOp(sel_lbls, coeffs=sel_coeffs)
+
+    # unknown type -> return input unchanged
+    return pauli_terms
 
 def create_rotation_gates_from_hamiltonian(pauli_terms: List[Tuple[str, complex]], 
                                           gamma: float) -> List[Tuple[str, List[int], float]]:
@@ -222,39 +242,71 @@ def propagate_hamiltonian_through_circuit(initial_pauli_terms: List[Tuple[str, c
     Returns:
         Propagated Pauli terms
     """
-    data, coeffs = map(list, zip(*initial_pauli_terms))
-    current_terms = SparsePauliOp(data, coeffs=np.array(coeffs, dtype=complex))
+    # Normalize input to SparsePauliOp
+    if isinstance(initial_pauli_terms, SparsePauliOp):
+        current_terms = initial_pauli_terms
+    else:
+        data, coeffs = map(list, zip(*initial_pauli_terms))
+        current_terms = SparsePauliOp(data, coeffs=np.array(coeffs, dtype=complex))
     
     # For each gate in the circuit
     for gate in circuit_gates:
+        # If current_terms accidentally is a tuple returned by pauli-prop, try to convert
+        if isinstance(current_terms, tuple):
+            try:
+                pauli_arr = current_terms[0]
+                coeffs = current_terms[1]
+                current_terms = SparsePauliOp(pauli_arr, coeffs=np.array(coeffs, dtype=complex))
+            except Exception:
+                pass
         if gate['type'] == 'rotation':
             # Propagate through rotation gates
-            
-			#Convert to rotation gates
-            gates, qargs, thetas = map(list, zip(*gate['gates']))
-			
-			#Fix gates
-            #Make rot_gates.gates a 2d array where each row is a list of 2 booleans for the X and Z components of the gate
-            gates = np.array([[True if g == 'X' else False, True if g == 'Z' else False] for g in gates])
+            # gate['gates'] is a list of tuples (pauli_char, qubits, angle)
+            gates_list = gate['gates']
+            if len(gates_list) == 0:
+                continue
+            chars, qargs, thetas = map(list, zip(*gates_list))
+            # Build boolean matrix for X/Z components expected by RotationGates
+            gates_bool = np.array([[c == 'X', c == 'Z'] for c in chars], dtype=bool)
+            # qargs should be list of qubit lists; ensure each entry is a sequence
+            qargs_seq = [qa if isinstance(qa, (list, tuple)) else [qa] for qa in qargs]
+            rot_gates = RotationGates(gates_bool, qargs_seq, thetas)
 
-            rot_gates = RotationGates(gates, qargs, thetas)
-            
-            current_terms = propagate_through_rotation_gates(
+            res = propagate_through_rotation_gates(
                 current_terms,
                 rot_gates=rot_gates,
                 max_terms=max_terms,
                 atol=ABS_CUTOFF,
                 frame='s'
             )
+            # propagate_through_rotation_gates may return a tuple (paulis, coeffs, ...)
+            if isinstance(res, tuple):
+                try:
+                    pauli_arr = res[0]
+                    coeffs = res[1]
+                    current_terms = SparsePauliOp(pauli_arr, coeffs=np.array(coeffs, dtype=complex))
+                except Exception:
+                    current_terms = res
+            else:
+                current_terms = res
         elif gate['type'] == 'operator':
             # Propagate through general operator
-            current_terms = propagate_through_operator(
+            res = propagate_through_operator(
                 current_terms,
                 op2=gate['operator'],
                 max_terms=max_terms,
                 atol=ABS_CUTOFF,
                 frame='s'
             )
+            if isinstance(res, tuple):
+                try:
+                    pauli_arr = res[0]
+                    coeffs = res[1]
+                    current_terms = SparsePauliOp(pauli_arr, coeffs=np.array(coeffs, dtype=complex))
+                except Exception:
+                    current_terms = res
+            else:
+                current_terms = res
         
         # Truncate after each step
         current_terms = truncate_pauli_terms(current_terms, max_terms)
@@ -326,6 +378,290 @@ def compute_objective(bitstring: str, mu: np.ndarray, sigma: np.ndarray,
     return obj
 
 
+def apply_rx_to_state(state: np.ndarray, theta: float, qubit: int, n_qubits: int) -> np.ndarray:
+    """Apply single-qubit RX rotation R_X(theta) to `qubit` on the state vector."""
+    # R_X(theta) = cos(theta/2) I - i sin(theta/2) X
+    c = np.cos(theta / 2)
+    s = -1j * np.sin(theta / 2)
+    U = np.array([[c, s], [s, c]], dtype=complex)
+    state = state.reshape([2] * n_qubits)
+    # tensordot U with axis qubit
+    new_state = np.tensordot(U, state, axes=([1], [qubit]))
+    # move axis 0 to position qubit
+    new_state = np.moveaxis(new_state, 0, qubit)
+    return new_state.reshape(-1)
+
+
+def statevector_qaoa(mu: np.ndarray, sigma: np.ndarray, gamma: float, beta: float, num_layers: int):
+    """Return statevector after applying QAOA with given gamma/beta using classical cost function."""
+    n_qubits = len(mu)
+    dim = 2 ** n_qubits
+    # initial |+> state
+    state = np.ones(dim, dtype=complex) / np.sqrt(dim)
+
+    # Precompute classical cost C(w) for each basis state w in {0,1}^n
+    C = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        b = format(idx, f'0{n_qubits}b')
+        C[idx] = compute_objective(b, mu, sigma, q=Q, lambda_param=LAMBDA, B_param=B)
+
+    for layer in range(num_layers):
+        # cost layer: apply phase e^{-i gamma C(w)}
+        state = state * np.exp(-1j * gamma * C)
+
+        # mixer layer: apply RX(2*beta) on each qubit
+        theta = 2 * beta
+        for q_idx in range(n_qubits):
+            state = apply_rx_to_state(state, theta, q_idx, n_qubits)
+
+    return state
+
+
+def compute_expectation_from_state(state: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> float:
+    """Compute expectation value of classical objective from state probabilities."""
+    n_qubits = len(mu)
+    dim = 2 ** n_qubits
+    probs = np.abs(state) ** 2
+    C = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        b = format(idx, f'0{n_qubits}b')
+        C[idx] = compute_objective(b, mu, sigma, q=Q, lambda_param=LAMBDA, B_param=B)
+    return float(np.sum(probs * C))
+
+
+def compute_expectation_plus_from_sparsepauli(sp: SparsePauliOp) -> float:
+    """Compute <+| sp |+> by summing coefficients of Pauli strings containing only I and X."""
+    coeffs = np.array(sp.coeffs, dtype=complex)
+    labels = [p.to_label() if hasattr(p, 'to_label') else str(p) for p in sp.paulis]
+    total = 0.0
+    for lab, c in zip(labels, coeffs):
+        if all(ch in ['I', 'X'] for ch in lab):
+            total += np.real(c)
+    return float(total)
+
+
+def pauli_dict_from_list(pauli_list: List[Tuple[str, complex]]) -> Dict[str, complex]:
+    return {p: complex(c) for p, c in pauli_list}
+
+
+def pauli_list_from_sparsepauli(sp: SparsePauliOp) -> List[Tuple[str, complex]]:
+    labels = [p.to_label() if hasattr(p, 'to_label') else str(p) for p in sp.paulis]
+    coeffs = np.array(sp.coeffs, dtype=complex)
+    return [(lab, coeffs[i]) for i, lab in enumerate(labels)]
+
+
+def sparsepauli_from_pauli_dict(pauli_dict: Dict[str, complex]) -> SparsePauliOp:
+    labels = list(pauli_dict.keys())
+    coeffs = np.array([pauli_dict[l] for l in labels], dtype=complex)
+    return SparsePauliOp(labels, coeffs=coeffs)
+
+
+def conjugate_pauli_by_rx_single(pauli_str: str, qubit: int, theta: float) -> Dict[str, complex]:
+    """Return mapping of Pauli strings after conjugation by RX(theta) on `qubit`.
+    U = RX(theta) = exp(-i theta X / 2); we compute U^† P U.
+    Rules:
+        Z -> cos(theta) * Z + sin(theta) * Y
+        Y -> cos(theta) * Y - sin(theta) * Z
+        X -> X, I -> I
+    """
+    ch = pauli_str[qubit]
+    c = np.cos(theta)
+    s = np.sin(theta)
+    out = {}
+    if ch == 'I' or ch == 'X':
+        out[pauli_str] = 1.0
+        return out
+
+    if ch == 'Z':
+        # Z -> c*Z + s*Y
+        s1 = pauli_str[:qubit] + 'Z' + pauli_str[qubit+1:]
+        s2 = pauli_str[:qubit] + 'Y' + pauli_str[qubit+1:]
+        out[s1] = c
+        out[s2] = s
+        return out
+
+    if ch == 'Y':
+        # Y -> c*Y - s*Z
+        s1 = pauli_str[:qubit] + 'Y' + pauli_str[qubit+1:]
+        s2 = pauli_str[:qubit] + 'Z' + pauli_str[qubit+1:]
+        out[s1] = c
+        out[s2] = -s
+        return out
+
+    # Fallback: unchanged
+    out[pauli_str] = 1.0
+    return out
+
+
+def propagate_pauli_terms_via_rx(initial_pauli_terms: List[Tuple[str, complex]],
+                                  circuit_gates: List[Any],
+                                  max_terms: int = MAX_TERMS,
+                                  abs_cutoff: float = ABS_CUTOFF) -> SparsePauliOp:
+    """Propagate Pauli operator H through the circuit in Heisenberg picture using
+    conjugation by RX mixers. Returns a SparsePauliOp representing H' = U^† H U.
+
+    Note: cost rotations (Z-based) commute with H (which is Z-only initially), so
+    we skip explicit conjugation by cost gates.
+    """
+    # start from dict
+    pauli_dict = pauli_dict_from_list(initial_pauli_terms)
+
+    for gate in circuit_gates:
+        # Only handle rotation gates
+        if gate['type'] != 'rotation':
+            continue
+        # gate['gates'] is a list of (char, qubits, angle)
+        for char, qlist, angle in gate['gates']:
+            # Skip cost Z-rotations, they commute with initial Z Hamiltonian
+            if char == 'Z':
+                continue
+            if char != 'X':
+                # Non-X single-qubit rotations not implemented here
+                continue
+
+            # apply RX(angle) conjugation on each specified qubit (qlist)
+            for q in qlist:
+                new_dict = {}
+                for pstr, coeff in pauli_dict.items():
+                    mapping = conjugate_pauli_by_rx_single(pstr, q, angle)
+                    for p2, factor in mapping.items():
+                        val = coeff * factor
+                        new_dict[p2] = new_dict.get(p2, 0) + val
+
+                # Prune small coefficients
+                # convert to list and truncate
+                items = [(p, c) for p, c in new_dict.items() if abs(c) > abs_cutoff]
+                if len(items) == 0:
+                    pauli_dict = {}
+                else:
+                    sp = truncate_pauli_terms(items, max_terms, abs_cutoff)
+                    # convert back to dict
+                    lst = pauli_list_from_sparsepauli(sp)
+                    pauli_dict = {p: c for p, c in lst}
+
+    # convert final dict to SparsePauliOp
+    if len(pauli_dict) == 0:
+        return SparsePauliOp.from_list(['I' * len(initial_pauli_terms[0][0])], coeffs=[0.0])
+    return sparsepauli_from_pauli_dict(pauli_dict)
+
+
+def build_pauli_diagonal_from_C(mu: np.ndarray, sigma: np.ndarray) -> List[Tuple[str, complex]]:
+    """Build diagonal Pauli operator H = sum_w C(w) |w><w| expressed as Z/I Pauli strings.
+
+    Returns list of (pauli_str, coeff) where pauli_str contains only 'I' or 'Z'.
+    """
+    n_qubits = len(mu)
+    dim = 2 ** n_qubits
+    Cvals = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        b = format(idx, f'0{n_qubits}b')
+        Cvals[idx] = compute_objective(b, mu, sigma, q=Q, lambda_param=LAMBDA, B_param=B)
+
+    pauli_terms = []
+    # For each Z-mask (which defines a Pauli string of Z/I)
+    for mask in range(dim):
+        pauli_str = ''.join(['Z' if ((mask >> (n_qubits-1-i)) & 1) else 'I' for i in range(n_qubits)])
+        # compute coefficient = (1/2^n) * sum_w C(w) * (-1)^{dot(w, mask_bits)}
+        # where mask bit ordering matches bitstring ordering used above
+        s = 0.0
+        for w in range(dim):
+            # compute parity of overlap between w and mask
+            overlap = bin(w & mask).count('1')
+            s += Cvals[w] * ((-1) ** overlap)
+        coeff = s / float(dim)
+        if abs(coeff) > 1e-15:
+            pauli_terms.append((pauli_str, complex(coeff)))
+
+    return pauli_terms
+
+
+def build_pauli_diagonal_from_hJ(h: np.ndarray, J: np.ndarray) -> List[Tuple[str, complex]]:
+    """Build diagonal Pauli operator H from Ising coefficients h and J.
+
+    H(x) = sum_{i<j} J[i,j] s_i s_j + sum_i h[i] s_i, where s_i = 1 - 2*x_i.
+    Returns Pauli expansion (Z/I strings) of H.
+    """
+    n_qubits = len(h)
+    dim = 2 ** n_qubits
+    Cvals = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        bits = format(idx, f'0{n_qubits}b')
+        s = np.array([1 - 2 * int(b) for b in bits], dtype=float)
+        quad = 0.0
+        for i in range(n_qubits):
+            for j in range(i+1, n_qubits):
+                quad += J[i, j] * s[i] * s[j]
+        lin = float(np.dot(h, s))
+        Cvals[idx] = quad + lin
+
+    pauli_terms = []
+    # For each Z-mask compute coefficient via Walsh-Hadamard transform
+    for mask in range(dim):
+        # construct pauli string for mask according to global bit order
+        if BIT_ORDER_MSB_FIRST:
+            pauli_str = ''.join(['Z' if ((mask >> (n_qubits - 1 - i)) & 1) else 'I' for i in range(n_qubits)])
+        else:
+            pauli_str = ''.join(['Z' if ((mask >> i) & 1) else 'I' for i in range(n_qubits)])
+        s = 0.0
+        for w in range(dim):
+            overlap = bin(w & mask).count('1')
+            s += Cvals[w] * ((-1) ** overlap)
+        coeff = s / float(dim)
+        if abs(coeff) > 1e-15:
+            pauli_terms.append((pauli_str, complex(coeff)))
+
+    return pauli_terms
+
+
+def determine_bit_ordering(h: np.ndarray, J: np.ndarray) -> bool:
+    """Determine whether MSB-first or LSB-first mask ordering matches state-vector.
+
+    Returns True if MSB-first should be used, False for LSB-first.
+    """
+    # small test with n=2 (if workspace uses more qubits, we still use first two)
+    n = len(h)
+    if n < 2:
+        return True
+
+    # pick small gamma/beta
+    gamma = 0.5
+    beta = 0.3
+    # compute state-vector expectation
+    state = statevector_qaoa(h_to_mu(h, J) if 'h_to_mu' in globals() else np.zeros(n), np.zeros((n,n)), gamma, beta, 1)
+    # Instead, build state more directly using h/J: compute C(w) from h/J
+    # Build Cvals
+    dim = 2 ** n
+    Cvals = np.zeros(dim)
+    for idx in range(dim):
+        bits = format(idx, f'0{n}b')
+        s = np.array([1 - 2 * int(b) for b in bits], dtype=float)
+        quad = 0.0
+        for i in range(n):
+            for j in range(i+1, n):
+                quad += J[i, j] * s[i] * s[j]
+        lin = float(np.dot(h, s))
+        Cvals[idx] = quad + lin
+    # produce state via cost and RX mixer
+    sv = np.ones(dim, dtype=complex) / np.sqrt(dim)
+    sv = sv * np.exp(-1j * gamma * Cvals)
+    for q in range(n):
+        sv = apply_rx_to_state(sv, 2*beta, q, n)
+    sv_exp = float(np.sum(np.abs(sv)**2 * Cvals))
+
+    # try both orderings
+    diffs = {}
+    for msb in [True, False]:
+        global BIT_ORDER_MSB_FIRST
+        BIT_ORDER_MSB_FIRST = msb
+        pauli = build_pauli_diagonal_from_hJ(h, J)
+        propagated = propagate_pauli_terms_via_rx(pauli, [{'type':'rotation','gates':[('X',[0],2*beta)]}], MAX_TERMS, ABS_CUTOFF)
+        exp_pauli = compute_expectation_plus_from_sparsepauli(propagated)
+        diffs[msb] = abs(exp_pauli - sv_exp)
+
+    # choose ordering with smaller difference
+    return min(diffs, key=diffs.get)
+
+
 def optimize_gamma_beta(pauli_terms: List[Tuple[str, complex]], n_qubits: int, num_layers: int,
                         mu: np.ndarray, sigma: np.ndarray,
                         gamma_steps: int = 7, beta_steps: int = 7,
@@ -341,47 +677,32 @@ def optimize_gamma_beta(pauli_terms: List[Tuple[str, complex]], n_qubits: int, n
     gammas = np.linspace(0.0, np.pi, gamma_steps)
     betas = np.linspace(0.0, np.pi/2, beta_steps)
 
-    best_max = -1.0
+    # We'll optimize the QAOA energy expectation computed from a state-vector simulator
+    best_val = float('inf')
     best_gamma = GAMMA
     best_beta = BETA
     best_results = {}
 
     for gamma in gammas:
-        # Precompute cost gates once per gamma
-        cost_gates = create_rotation_gates_from_hamiltonian(pauli_terms, gamma)
-
         for beta in betas:
-            # Build simple circuit using same gamma/beta across layers
-            qaoa_circuit = []
-            for layer in range(num_layers):
-                qaoa_circuit.append({
-                    'type': 'rotation',
-                    'gates': cost_gates,
-                    'layer': layer,
-                    'type_name': 'cost'
-                })
-                mixer_gates = [('X', [i], 2 * beta) for i in range(n_qubits)]
-                qaoa_circuit.append({
-                    'type': 'rotation',
-                    'gates': mixer_gates,
-                    'layer': layer,
-                    'type_name': 'mixer'
-                })
+            # use state-vector simulator to compute exact expectation value
+            state = statevector_qaoa(mu, sigma, gamma, beta, num_layers)
+            expval = compute_expectation_from_state(state, mu, sigma)
 
-            propagated = propagate_hamiltonian_through_circuit(pauli_terms, qaoa_circuit, MAX_TERMS)
-            results = simulate(propagated, n_qubits, shots=shots, noise_model=noise_model, noise_prob=noise_prob)
-            if results:
-                max_p = max(results.values())
-            else:
-                max_p = 0.0
-
-            if max_p > best_max:
-                best_max = max_p
+            # lower is better (we minimize the cost expectation)
+            if expval < best_val:
+                best_val = expval
                 best_gamma = gamma
                 best_beta = beta
-                best_results = results
+                # sample distribution for reporting if shots provided else exact probs
+                if shots and shots > 0:
+                    probs = np.abs(state) ** 2
+                    counts = np.random.multinomial(shots, probs)
+                    best_results = {format(i, f'0{n_qubits}b'): float(c) / shots for i, c in enumerate(counts) if c > 0}
+                else:
+                    best_results = {format(i, f'0{n_qubits}b'): float(p) for i, p in enumerate(np.abs(state) ** 2)}
 
-    return best_max, best_gamma, best_beta, best_results
+    return best_val, best_gamma, best_beta, best_results
 
 def simulate(pauli_terms: List[Tuple[str, complex]], 
                          n_qubits: int, 
@@ -481,6 +802,69 @@ def simulate(pauli_terms: List[Tuple[str, complex]],
 # MAIN EXECUTION
 # ============================================================================
 
+
+def run_pauli_state_diagnostic(h: np.ndarray, J: np.ndarray, gamma: float, beta: float, num_layers: int = 1, n_diag: int = 2):
+    """Run a focused diagnostic comparing state-vector expectation vs native Pauli propagation for small n_diag qubits.
+
+    Prints per-term contributions and the two expectation values to help identify ordering/conjugation mismatches.
+    """
+    n = min(n_diag, len(h))
+    h_small = h[:n].copy()
+    J_small = J[:n, :n].copy()
+
+    # Build classical cost values C(w) for small system
+    dim = 2 ** n
+    Cvals = np.zeros(dim, dtype=float)
+    for idx in range(dim):
+        bits = format(idx, f'0{n}b')
+        s = np.array([1 - 2 * int(b) for b in bits], dtype=float)
+        quad = 0.0
+        for i in range(n):
+            for j in range(i+1, n):
+                quad += J_small[i, j] * s[i] * s[j]
+        lin = float(np.dot(h_small, s))
+        Cvals[idx] = quad + lin
+
+    # Build state-vector via cost-phase then RX mixers (as in statevector_qaoa)
+    sv = np.ones(dim, dtype=complex) / np.sqrt(dim)
+    sv = sv * np.exp(-1j * gamma * Cvals)
+    for layer in range(num_layers):
+        for q in range(n):
+            sv = apply_rx_to_state(sv, 2 * beta, q, n)
+
+    exp_sv = float(np.sum(np.abs(sv) ** 2 * Cvals))
+
+    # Build diagonal Pauli operator from h/J for small system
+    diag_pauli = build_pauli_diagonal_from_hJ(h_small, J_small)
+
+    # Build a small QAOA circuit containing only mixer RXs (cost is diagonal)
+    qaoa_small = []
+    for layer in range(num_layers):
+        qaoa_small.append({'type': 'rotation', 'gates': [('X', [i], 2 * beta) for i in range(n)], 'layer': layer, 'type_name': 'mixer'})
+
+    # Propagate via native Pauli propagation
+    propagated = propagate_pauli_terms_via_rx(diag_pauli, qaoa_small, MAX_TERMS, ABS_CUTOFF)
+    exp_pauli = compute_expectation_plus_from_sparsepauli(propagated)
+
+    print('\n--- Diagnostic: Pauli vs State-vector (n=%d, layers=%d) ---' % (n, num_layers))
+    print('State-vector expectation:', exp_sv)
+    print('Pauli-prop (native) expectation on |+>:', exp_pauli)
+
+    # Show initial diagonal terms and propagated top terms
+    print('\nInitial diagonal Pauli terms:')
+    for p, c in diag_pauli[: min(8, len(diag_pauli))]:
+        print('  ', p, c)
+
+    print('\nPropagated Pauli terms (top 16):')
+    try:
+        lst = pauli_list_from_sparsepauli(propagated)
+        for p, c in lst[:16]:
+            print('  ', p, c)
+    except Exception:
+        print('  (failed to list propagated terms)')
+
+    print('--- end diagnostic ---\n')
+
 def main():
     """Main execution function."""
     print("=" * 60)
@@ -528,7 +912,7 @@ def main():
         noise_model=NOISE_MODEL, noise_prob=NOISE_PROB
     )
 
-    print(f"Tuning complete. Best max probability {best_max:.4f} at gamma={best_gamma:.4f}, beta={best_beta:.4f}")
+    print(f"Tuning complete. Best expectation {best_max:.6f} at gamma={best_gamma:.4f}, beta={best_beta:.4f}")
 
     # Create rotation gates for cost Hamiltonian exponentiation using best_gamma
     cost_gates = create_rotation_gates_from_hamiltonian(pauli_terms, best_gamma)
@@ -552,26 +936,46 @@ def main():
 
     print(f"Built QAOA circuit with tuned gamma/beta across {NUM_LAYERS} layers")
     print()
-    
-    # Step 5: Propagate through circuit (if pauli-prop available)
-    print("Step 5: Propagating Hamiltonian through QAOA circuit...")
-    
-    propagated_terms = propagate_hamiltonian_through_circuit(
-        pauli_terms, qaoa_circuit, MAX_TERMS
-    )
-    print(f"Propagated operator has {len(propagated_terms)} terms")
-    
-    # Show truncated terms
-    print("\nTop propagated Pauli terms:")
-    sorted_terms = sorted(propagated_terms, key=lambda x: abs(x.coeffs), reverse=True)
-    for i, item in enumerate(sorted_terms[:10]):
-        print(f"  {i+1}. {item.paulis[0]}: {item.coeffs[0]:.6f}")
-    if len(sorted_terms) > 10:
-        print(f"  ... and {len(sorted_terms)-10} more terms")
-    
-    print("Step 6: Simulating...")
-    # Use sampling for final reporting (1000 shots)
-    results = simulate(propagated_terms, n_qubits, shots=1000, noise_model=NOISE_MODEL, noise_prob=NOISE_PROB)
+    # Run a small diagnostic to compare native Pauli propagation vs state-vector for a small subsystem
+    try:
+        run_pauli_state_diagnostic(h_coeffs, J_coeffs, best_gamma, best_beta, num_layers=NUM_LAYERS, n_diag=min(3, n_qubits))
+    except Exception as e:
+        print('Diagnostic failed:', e)
+    # Step 5: Build final state via state-vector QAOA and sample measurements
+    print("Step 5: Building QAOA statevector and sampling measurements...")
+    # Build final state using state-vector QAOA (this is the definitive simulator for correctness)
+    state = statevector_qaoa(mu, sigma, best_gamma, best_beta, NUM_LAYERS)
+    expval_state = compute_expectation_from_state(state, mu, sigma)
+    print(f"State-vector expectation value: {expval_state:.6f}")
+
+    # Sample measurement outcomes according to state probabilities (apply noise if requested)
+    probs = np.abs(state) ** 2
+    if NOISE_MODEL == 'none' or NOISE_PROB <= 0.0:
+        counts = np.random.multinomial(1000, probs)
+        results = {format(i, f'0{n_qubits}b'): float(c) / 1000 for i, c in enumerate(counts) if c > 0}
+    else:
+        sampled = np.random.choice(2 ** n_qubits, size=1000, p=probs)
+        noisy_counts = {}
+        for idx in sampled:
+            bitstr = list(format(int(idx), f'0{n_qubits}b'))
+            for q in range(n_qubits):
+                if np.random.random() < NOISE_PROB:
+                    bitstr[q] = '1' if bitstr[q] == '0' else '0'
+            noisy = ''.join(bitstr)
+            noisy_counts[noisy] = noisy_counts.get(noisy, 0) + 1
+        results = {bs: cnt / 1000 for bs, cnt in noisy_counts.items()}
+
+    # Pauli-prop native: propagate H through mixers in Heisenberg picture
+    try:
+        # Build diagonal Pauli operator corresponding exactly to Ising h/J
+        diag_pauli = build_pauli_diagonal_from_hJ(h_coeffs, J_coeffs)
+        propagated_terms = propagate_pauli_terms_via_rx(diag_pauli, qaoa_circuit, MAX_TERMS, ABS_CUTOFF)
+        expval_pauli = compute_expectation_plus_from_sparsepauli(propagated_terms)
+        print(f"Pauli-prop (native) expectation on |+>: {expval_pauli:.6f}")
+        if abs(expval_pauli - expval_state) > 1e-6:
+            print("Warning: pauli-prop expectation differs from state-vector by", expval_pauli - expval_state)
+    except Exception as e:
+        print("Pauli-prop native propagation failed:", e)
 
     # Step 7: Display results
     print("\n" + "=" * 60)
