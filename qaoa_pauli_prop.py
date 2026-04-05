@@ -443,9 +443,9 @@ def main():
             # Check budget constraint
             budget_violation = abs(len(selected_indices) - B)
             if budget_violation > 0.1:
-                print(f"⚠️  Budget violation: selected {len(selected_indices)}, target {B}")
+                print(f"Budget violation: selected {len(selected_indices)}, target {B}")
             else:
-                print(f"✓ Budget constraint satisfied (selected {len(selected_indices)})")
+                print(f"Budget constraint satisfied (selected {len(selected_indices)})")
     
     print("\n" + "=" * 60)
     print("Simulation complete!")
