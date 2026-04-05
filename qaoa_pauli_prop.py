@@ -102,34 +102,20 @@ def construct_qubo_hamiltonian(mu: np.ndarray, sigma: np.ndarray,
         J: Quadratic coefficients for Ising model
     """
     N = len(mu)
-    Q_matrix = np.zeros((N, N))
     
-    # Fill Q matrix according to formula:
-    # Q_{ij} = q*sigma_{i,j} + lambda for i != j
-    # Q_{ii} = q*sigma_{i,i} + lambda - mu_i - 2*lambda*B
-    for i in range(N):
-        for j in range(N):
-            if i != j:
-                Q_matrix[i, j] = q * sigma[i, j] + lambda_param
-            else:
-                Q_matrix[i, j] = q * sigma[i, i] + lambda_param - mu[i] - 2 * lambda_param * B
-    
-    # Convert to Ising model coefficients
-    # For Ising: H = sum_i h_i Z_i + sum_{i<j} J_{ij} Z_i Z_j
     h = np.zeros(N)
     J = np.zeros((N, N))
     
     for i in range(N):
-        # h_i = 1/2 * sum_j Q_{ij}
-        h[i] = 0.5 * np.sum(Q_matrix[i, :])
+        h[i] = q * sigma[i, i] - mu[i] + lambda_param * (1 - 2*B)
+    
     
     for i in range(N):
         for j in range(i+1, N):
-            # J_{ij} = 1/2 * Q_{ij} for i<j
-            J[i, j] = 0.5 * Q_matrix[i, j]
-            J[j, i] = J[i, j]  # Keep symmetric
+            J[i, j] = 2 * q * sigma[i, j] + 2 * lambda_param
+            J[j, i] = J[i, j]
     
-    return Q_matrix, h, J
+    return h, J
 
 def hamiltonian_to_pauli_list(h: np.ndarray, J: np.ndarray) -> List[Tuple[str, complex]]:
     """
@@ -448,7 +434,7 @@ def main():
     
     # Step 2: Construct Hamiltonian
     print("Step 2: Constructing QUBO/Ising Hamiltonian...")
-    Q_matrix, h_coeffs, J_coeffs = construct_qubo_hamiltonian(mu, sigma, LAMBDA, B, Q)
+    h_coeffs, J_coeffs = construct_qubo_hamiltonian(mu, sigma, LAMBDA, B, Q)
     print(f"Linear coefficients (h): {h_coeffs}")
     print(f"Number of quadratic terms: {np.sum(np.abs(J_coeffs) > 1e-10)}")
     print()
