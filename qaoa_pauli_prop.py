@@ -754,8 +754,8 @@ def optimize_gamma_beta(pauli_terms: List[Tuple[str, complex]], n_qubits: int, n
 def simulate(pauli_terms: List[Tuple[str, complex]], 
                          n_qubits: int, 
                          shots: int = 1000,
-                         noise_model: str = 'none',
-                         noise_prob: float = 0.0) -> Dict[str, float]:
+                         noise_model: str = NOISE_MODEL,
+                         noise_prob: float = NOISE_PROB) -> Dict[str, float]:
     """
     Args:
         pauli_terms: List of (pauli_string, coefficient)
