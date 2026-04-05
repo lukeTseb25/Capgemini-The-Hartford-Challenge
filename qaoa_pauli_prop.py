@@ -20,6 +20,10 @@ Q = 0.7           # Risk aversion parameter
 ASSETS = 8
 ASSET_IDS = None
 
+# Noise settings for simulation
+NOISE_MODEL = 'none'  # options: 'none', 'bit_flip'
+NOISE_PROB = 0.000     # per-qubit flip probability when using 'bit_flip'
+
 # QAOA parameters
 NUM_LAYERS = 10    # Number of QAOA layers (p)
 GAMMA = 0.5       # Initial gamma parameter (cost Hamiltonian angle)
@@ -321,9 +325,69 @@ def compute_objective(bitstring: str, mu: np.ndarray, sigma: np.ndarray,
     obj = q * quad - linear + lambda_param * (np.sum(w) - B_param) ** 2
     return obj
 
+
+def optimize_gamma_beta(pauli_terms: List[Tuple[str, complex]], n_qubits: int, num_layers: int,
+                        mu: np.ndarray, sigma: np.ndarray,
+                        gamma_steps: int = 7, beta_steps: int = 7,
+                        shots: int = 500,
+                        noise_model: str = 'none', noise_prob: float = 0.0) -> Tuple[float, float, float, Dict[str, float]]:
+    """
+    Coarse grid search to find gamma and beta (scalars used for all layers)
+    that maximize the maximum measurement probability (i.e., concentrate
+    the state onto a single bitstring).
+
+    Returns: (best_max_prob, best_gamma, best_beta, results_dict)
+    """
+    gammas = np.linspace(0.0, np.pi, gamma_steps)
+    betas = np.linspace(0.0, np.pi/2, beta_steps)
+
+    best_max = -1.0
+    best_gamma = GAMMA
+    best_beta = BETA
+    best_results = {}
+
+    for gamma in gammas:
+        # Precompute cost gates once per gamma
+        cost_gates = create_rotation_gates_from_hamiltonian(pauli_terms, gamma)
+
+        for beta in betas:
+            # Build simple circuit using same gamma/beta across layers
+            qaoa_circuit = []
+            for layer in range(num_layers):
+                qaoa_circuit.append({
+                    'type': 'rotation',
+                    'gates': cost_gates,
+                    'layer': layer,
+                    'type_name': 'cost'
+                })
+                mixer_gates = [('X', [i], 2 * beta) for i in range(n_qubits)]
+                qaoa_circuit.append({
+                    'type': 'rotation',
+                    'gates': mixer_gates,
+                    'layer': layer,
+                    'type_name': 'mixer'
+                })
+
+            propagated = propagate_hamiltonian_through_circuit(pauli_terms, qaoa_circuit, MAX_TERMS)
+            results = simulate(propagated, n_qubits, shots=shots, noise_model=noise_model, noise_prob=noise_prob)
+            if results:
+                max_p = max(results.values())
+            else:
+                max_p = 0.0
+
+            if max_p > best_max:
+                best_max = max_p
+                best_gamma = gamma
+                best_beta = beta
+                best_results = results
+
+    return best_max, best_gamma, best_beta, best_results
+
 def simulate(pauli_terms: List[Tuple[str, complex]], 
                          n_qubits: int, 
-                         shots: int = 1000) -> Dict[str, float]:
+                         shots: int = 1000,
+                         noise_model: str = 'none',
+                         noise_prob: float = 0.0) -> Dict[str, float]:
     """
     Args:
         pauli_terms: List of (pauli_string, coefficient)
@@ -387,18 +451,30 @@ def simulate(pauli_terms: List[Tuple[str, complex]],
             exps = np.exp((scores - np.max(scores)) / (temp + 1e-12))
             probs = exps / np.sum(exps)
 
-    # Sample measurement outcomes according to probabilities
+    # Return exact probabilities if shots not provided
     if shots is None or shots <= 0:
-        # Return exact probabilities
-        result = {format(i, f'0{n_qubits}b'): float(probs[i]) for i in range(dim)}
+        return {format(i, f'0{n_qubits}b'): float(probs[i]) for i in range(dim)}
+
+    # If no noise, use multinomial sampling for efficiency
+    if noise_model == 'none' or noise_prob <= 0.0:
+        counts = np.random.multinomial(shots, probs)
+        result = {format(i, f'0{n_qubits}b'): float(c) / float(shots)
+                  for i, c in enumerate(counts) if c > 0}
         return result
 
-    counts = np.random.multinomial(shots, probs)
-    result = {}
-    for i, c in enumerate(counts):
-        if c > 0:
-            result[format(i, f'0{n_qubits}b')] = float(c) / float(shots)
+    # If noise is enabled, sample shots individually and apply per-qubit bit-flip noise
+    sampled_indices = np.random.choice(dim, size=shots, p=probs)
+    noisy_counts = {}
+    for idx in sampled_indices:
+        bitstr = list(format(int(idx), f'0{n_qubits}b'))
+        # apply bit-flip noise per qubit
+        for q in range(n_qubits):
+            if np.random.random() < noise_prob:
+                bitstr[q] = '1' if bitstr[q] == '0' else '0'
+        noisy = ''.join(bitstr)
+        noisy_counts[noisy] = noisy_counts.get(noisy, 0) + 1
 
+    result = {bs: cnt / shots for bs, cnt in noisy_counts.items()}
     return result
 
 # ============================================================================
@@ -442,35 +518,39 @@ def main():
         print(f"  ... and {len(pauli_terms)-5} more terms")
     print()
     
-    # Step 4: Create circuit gates for propagation
-    print("Step 4: Creating QAOA circuit for propagation...")
-    
-    # Create rotation gates for cost Hamiltonian exponentiation
-    cost_gates = create_rotation_gates_from_hamiltonian(pauli_terms, GAMMA)
-    print(f"Created {len(cost_gates)} rotation gates for cost layer")
-    
-    # Build full QAOA circuit
+    # Step 4: Tune or create circuit gates for propagation
+    print("Step 4: Tuning/creating QAOA circuit for propagation...")
+
+    # Perform a coarse grid search to tune scalar gamma and beta (applied to all layers)
+    # Use exact probability evaluation during tuning to get deterministic peak probabilities
+    best_max, best_gamma, best_beta, best_results = optimize_gamma_beta(
+        pauli_terms, n_qubits, NUM_LAYERS, mu, sigma, gamma_steps=7, beta_steps=7, shots=None,
+        noise_model=NOISE_MODEL, noise_prob=NOISE_PROB
+    )
+
+    print(f"Tuning complete. Best max probability {best_max:.4f} at gamma={best_gamma:.4f}, beta={best_beta:.4f}")
+
+    # Create rotation gates for cost Hamiltonian exponentiation using best_gamma
+    cost_gates = create_rotation_gates_from_hamiltonian(pauli_terms, best_gamma)
+    mixer_gates_template = [('X', [i], 2 * best_beta) for i in range(n_qubits)]
+
+    # Build full QAOA circuit using tuned parameters
     qaoa_circuit = []
     for layer in range(NUM_LAYERS):
-        # Cost layer: e^{-i*gamma*H_C}
         qaoa_circuit.append({
             'type': 'rotation',
             'gates': cost_gates,
             'layer': layer,
             'type_name': 'cost'
         })
-        
-        # Mixer layer: e^{-i*beta*sum X_i}
-        # Create RX gates for each qubit
-        mixer_gates = [('X', [i], 2 * BETA) for i in range(n_qubits)]
         qaoa_circuit.append({
             'type': 'rotation',
-            'gates': mixer_gates,
+            'gates': mixer_gates_template,
             'layer': layer,
             'type_name': 'mixer'
         })
-    
-    print(f"Built QAOA circuit with {len(qaoa_circuit)} layers ({NUM_LAYERS} iterations)")
+
+    print(f"Built QAOA circuit with tuned gamma/beta across {NUM_LAYERS} layers")
     print()
     
     # Step 5: Propagate through circuit (if pauli-prop available)
@@ -489,9 +569,10 @@ def main():
     if len(sorted_terms) > 10:
         print(f"  ... and {len(sorted_terms)-10} more terms")
     
-    print("Step 6: Simulating...s")
-    results = simulate(propagated_terms, n_qubits, shots=1000)
-    
+    print("Step 6: Simulating...")
+    # Use sampling for final reporting (1000 shots)
+    results = simulate(propagated_terms, n_qubits, shots=1000, noise_model=NOISE_MODEL, noise_prob=NOISE_PROB)
+
     # Step 7: Display results
     print("\n" + "=" * 60)
     print("SIMULATION RESULTS")
