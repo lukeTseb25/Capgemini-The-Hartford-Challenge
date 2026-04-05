@@ -23,7 +23,7 @@ ASSETS = 8
 ASSET_IDS = None
 
 # Noise settings for simulation
-NOISE_MODEL = 'none'  # options: 'none', 'bit_flip'
+NOISE_MODEL = 'bit_flip'  # options: 'none', 'bit_flip'
 NOISE_PROB = 0.02     # per-qubit flip probability when using 'bit_flip'
 
 # QAOA parameters
