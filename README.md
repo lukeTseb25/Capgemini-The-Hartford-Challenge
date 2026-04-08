@@ -1,4 +1,19 @@
-# YQuantum Hackathon: 
+# LIB Dependency YQuantum Project
+Within 24 hours we designed this quantum solution using QAOA Hamiltonian Simulation with Pauli Propagation and implemented it into a Flutter mobile app.
+- qaoa_pauli_prop.py: Our quantum computing code
+- YQuantum2026_Portfolio_Optimization.pdf: An explanation of our math
+- Mobile folder: Flutter application
+
+
+
+<table>
+  <tr>
+    <td><img src="./screenshots/app_screenshot_1.png" width="200"></td>
+    <td><img src="./screenshots/app_screenshot_2.png" width="200"></td>
+  </tr>
+</table>
+
+# Prompt: 
 
 ## Optimization of Premium Investment Portfolios
 
